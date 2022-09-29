@@ -114,6 +114,19 @@ func GceAttestationKeyECC(rw io.ReadWriter) (*Key, error) {
 	return akEcc, nil
 }
 
+// LoadCachedKey loads a key from cachedHandle.
+// If the key is not found, an error is returned.
+// This function will no overwrite an existing key, unlike NewCachedKey.
+func LoadCachedKey(rw io.ReadWriter, cachedHandle tpmutil.Handle) (k *Key, err error) {
+	cachedPub, _, _, err := tpm2.ReadPublic(rw, cachedHandle)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read public area of cached key: %w", err)
+	}
+
+	k = &Key{rw: rw, handle: cachedHandle, pubArea: cachedPub, session: nullSession{}}
+	return k, k.finish()
+}
+
 // KeyFromNvIndex generates and loads a key under the provided parent
 // (possibly a hierarchy root tpm2.Handle{Owner|Endorsement|Platform|Null})
 // using the template stored at the provided nvdata index.
