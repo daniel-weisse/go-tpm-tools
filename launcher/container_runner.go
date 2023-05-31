@@ -11,7 +11,10 @@ import (
 	"math/rand"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
+	"strconv"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/compute/metadata"
@@ -91,14 +94,17 @@ func fetchImpersonatedToken(ctx context.Context, serviceAccount string, audience
 
 // NewRunner returns a runner.
 func NewRunner(ctx context.Context, cdClient *containerd.Client, token oauth2.Token, launchSpec spec.LaunchSpec, mdsClient *metadata.Client, tpm io.ReadWriteCloser, logger *log.Logger) (*ContainerRunner, error) {
-	image, err := initImage(ctx, cdClient, launchSpec, token, logger)
+	image, err := initImage(ctx, cdClient, launchSpec, token)
 	if err != nil {
 		return nil, err
 	}
 
 	mounts := make([]specs.Mount, 0)
 	mounts = appendTokenMounts(mounts)
-	envs := parseEnvVars(launchSpec.Envs)
+	envs, err := formatEnvVars(launchSpec.Envs)
+	if err != nil {
+		return nil, err
+	}
 	// Check if there is already a container
 	container, err := cdClient.LoadContainer(ctx, containerID)
 	if err == nil {
@@ -111,13 +117,18 @@ func NewRunner(ctx context.Context, cdClient *containerd.Client, token oauth2.To
 	logger.Printf("Operator Override Env Vars : %v\n", envs)
 	logger.Printf("Operator Override Cmd      : %v\n", launchSpec.Cmd)
 
-	imageLabels, err := getImageLabels(ctx, image)
+	imageConfig, err := getImageConfig(ctx, image)
 	if err != nil {
-		logger.Printf("Failed to get image OCI labels %v\n", err)
+		return nil, err
 	}
 
-	logger.Printf("Image Labels               : %v\n", imageLabels)
-	launchPolicy, err := spec.GetLaunchPolicy(imageLabels)
+	logger.Printf("Exposed Ports:             : %v\n", imageConfig.ExposedPorts)
+	if err := openPorts(imageConfig.ExposedPorts); err != nil {
+		return nil, err
+	}
+
+	logger.Printf("Image Labels               : %v\n", imageConfig.Labels)
+	launchPolicy, err := spec.GetLaunchPolicy(imageConfig.Labels)
 	if err != nil {
 		return nil, err
 	}
@@ -125,11 +136,11 @@ func NewRunner(ctx context.Context, cdClient *containerd.Client, token oauth2.To
 		return nil, err
 	}
 
-	if imageConfig, err := image.Config(ctx); err != nil {
+	if imageConfigDescriptor, err := image.Config(ctx); err != nil {
 		logger.Println(err)
 	} else {
-		logger.Printf("Image ID                   : %v\n", imageConfig.Digest)
-		logger.Printf("Image Annotations          : %v\n", imageConfig.Annotations)
+		logger.Printf("Image ID                   : %v\n", imageConfigDescriptor.Digest)
+		logger.Printf("Image Annotations          : %v\n", imageConfigDescriptor.Annotations)
 	}
 
 	hostname, err := os.Hostname()
@@ -205,6 +216,7 @@ func NewRunner(ctx context.Context, cdClient *containerd.Client, token oauth2.To
 	}
 
 	asAddr := launchSpec.AttestationServiceAddr
+
 	verifierClient, err := getRESTClient(ctx, asAddr, launchSpec)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create REST verifier client: %v", err)
@@ -232,21 +244,24 @@ func getRESTClient(ctx context.Context, asAddr string, spec spec.LaunchSpec) (ve
 		opts = append(opts, option.WithEndpoint(asAddr))
 	}
 
-	const defaultRegion = "us-central1"
-	restClient, err := rest.NewClient(ctx, spec.ProjectID, defaultRegion, opts...)
+	restClient, err := rest.NewClient(ctx, spec.ProjectID, spec.Region, opts...)
 	if err != nil {
 		return nil, err
 	}
 	return restClient, nil
 }
 
-// parseEnvVars parses the environment variables to the oci format
-func parseEnvVars(envVars []spec.EnvVar) []string {
+// formatEnvVars formats the environment variables to the oci format
+func formatEnvVars(envVars []spec.EnvVar) ([]string, error) {
 	var result []string
 	for _, envVar := range envVars {
-		result = append(result, envVar.Name+"="+envVar.Value)
+		ociFormat, err := cel.FormatEnvVar(envVar.Name, envVar.Value)
+		if err != nil {
+			return nil, fmt.Errorf("failed to format env var: %v", err)
+		}
+		result = append(result, ociFormat)
 	}
-	return result
+	return result, nil
 }
 
 // appendTokenMounts appends the default mount specs for the OIDC token
@@ -276,8 +291,8 @@ func (r *ContainerRunner) measureContainerClaims(ctx context.Context) error {
 	if err := r.attestAgent.MeasureEvent(cel.CosTlv{EventType: cel.RestartPolicyType, EventContent: []byte(r.launchSpec.RestartPolicy)}); err != nil {
 		return err
 	}
-	if imageConfig, err := image.Config(ctx); err == nil { // if NO error
-		if err := r.attestAgent.MeasureEvent(cel.CosTlv{EventType: cel.ImageIDType, EventContent: []byte(imageConfig.Digest)}); err != nil {
+	if imageConfigDescriptor, err := image.Config(ctx); err == nil { // if NO error
+		if err := r.attestAgent.MeasureEvent(cel.CosTlv{EventType: cel.ImageIDType, EventContent: []byte(imageConfigDescriptor.Digest)}); err != nil {
 			return err
 		}
 	}
@@ -298,7 +313,10 @@ func (r *ContainerRunner) measureContainerClaims(ctx context.Context) error {
 	}
 
 	// Measure the input overridden Env Vars and Args separately, these should be subsets of the Env Vars and Args above.
-	envs := parseEnvVars(r.launchSpec.Envs)
+	envs, err := formatEnvVars(r.launchSpec.Envs)
+	if err != nil {
+		return err
+	}
 	for _, env := range envs {
 		if err := r.attestAgent.MeasureEvent(cel.CosTlv{EventType: cel.OverrideEnvType, EventContent: []byte(env)}); err != nil {
 			return err
@@ -382,7 +400,7 @@ func (r *ContainerRunner) fetchAndWriteTokenWithRetry(ctx context.Context,
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				r.logger.Printf("token refreshing stopped: %v", ctx.Err())
+				r.logger.Println("token refreshing stopped")
 				return
 			case <-timer.C:
 				var duration time.Duration
@@ -479,64 +497,97 @@ func (r *ContainerRunner) Run(ctx context.Context) error {
 	if err != nil {
 		return &RetryableError{err}
 	}
-	exitStatus, err := task.Wait(ctx)
+	defer task.Delete(ctx)
+
+	exitStatusC, err := task.Wait(ctx)
 	if err != nil {
-		return &RetryableError{err}
+		r.logger.Println(err)
 	}
 	r.logger.Println("workload task started")
 
 	if err := task.Start(ctx); err != nil {
 		return &RetryableError{err}
 	}
-	status := <-exitStatus
+	status := <-exitStatusC
 
 	code, _, err := status.Result()
 	if err != nil {
 		return err
 	}
-	if _, err := task.Delete(ctx); err != nil {
-		return err
-	}
+
 	if code != 0 {
+		r.logger.Println("workload task ended and returned non-zero")
 		return &WorkloadError{code}
 	}
+	r.logger.Println("workload task ended and returned 0")
 	return nil
 }
 
-func initImage(ctx context.Context, cdClient *containerd.Client, launchSpec spec.LaunchSpec, token oauth2.Token, logger *log.Logger) (containerd.Image, error) {
-	var remoteOpt containerd.RemoteOpt
+func initImage(ctx context.Context, cdClient *containerd.Client, launchSpec spec.LaunchSpec, token oauth2.Token) (containerd.Image, error) {
 	if token.Valid() {
-		remoteOpt = containerd.WithResolver(Resolver(token.AccessToken))
-	} else {
-		logger.Println("invalid auth token, will use empty auth")
-	}
+		remoteOpt := containerd.WithResolver(Resolver(token.AccessToken))
 
-	image, err := cdClient.Pull(ctx, launchSpec.ImageRef, containerd.WithPullUnpack, remoteOpt)
+		image, err := cdClient.Pull(ctx, launchSpec.ImageRef, containerd.WithPullUnpack, remoteOpt)
+		if err != nil {
+			return nil, fmt.Errorf("cannot pull the image: %w", err)
+		}
+		return image, nil
+	}
+	image, err := cdClient.Pull(ctx, launchSpec.ImageRef, containerd.WithPullUnpack)
 	if err != nil {
-		return nil, fmt.Errorf("cannot pull image: %w", err)
+		return nil, fmt.Errorf("cannot pull the image (no token, only works for a public image): %w", err)
 	}
 	return image, nil
 }
 
-func getImageLabels(ctx context.Context, image containerd.Image) (map[string]string, error) {
-	// TODO(jiankun): Switch to containerd's WithImageConfigLabels()
+// openPorts writes firewall rules to accept all traffic into that port and protocol using iptables.
+func openPorts(ports map[string]struct{}) error {
+	for k := range ports {
+		portAndProtocol := strings.Split(k, "/")
+		if len(portAndProtocol) != 2 {
+			return fmt.Errorf("failed to parse port and protocol: got %s, expected [port]/[protocol] 80/tcp", portAndProtocol)
+		}
+
+		port := portAndProtocol[0]
+		_, err := strconv.ParseUint(port, 10, 16)
+		if err != nil {
+			return fmt.Errorf("received invalid port number: %v, %w", port, err)
+		}
+
+		protocol := portAndProtocol[1]
+		if protocol != "tcp" && protocol != "udp" {
+			return fmt.Errorf("received unknown protocol: got %s, expected tcp or udp", protocol)
+		}
+
+		// This command will write a firewall rule to accept all INPUT packets for the given port/protocol.
+		cmd := exec.Command("iptables", "-A", "INPUT", "-p", protocol, "--dport", port, "-j", "ACCEPT")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to open port %s %s: %v %s", port, protocol, err, out)
+		}
+	}
+
+	return nil
+}
+
+func getImageConfig(ctx context.Context, image containerd.Image) (v1.ImageConfig, error) {
 	ic, err := image.Config(ctx)
 	if err != nil {
-		return nil, err
+		return v1.ImageConfig{}, err
 	}
 	switch ic.MediaType {
 	case v1.MediaTypeImageConfig, images.MediaTypeDockerSchema2Config:
 		p, err := content.ReadBlob(ctx, image.ContentStore(), ic)
 		if err != nil {
-			return nil, err
+			return v1.ImageConfig{}, err
 		}
 		var ociimage v1.Image
 		if err := json.Unmarshal(p, &ociimage); err != nil {
-			return nil, err
+			return v1.ImageConfig{}, err
 		}
-		return ociimage.Config.Labels, nil
+		return ociimage.Config, nil
 	}
-	return nil, fmt.Errorf("unknown image config media type %s", ic.MediaType)
+	return v1.ImageConfig{}, fmt.Errorf("unknown image config media type %s", ic.MediaType)
 }
 
 // Close the container runner
